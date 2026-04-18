@@ -1,10 +1,10 @@
 schema_version = "1.0.0"
 
 id = "axis_extrude"
-version = "1.0.0"
+version = "0.2.0"
 name = "Axis Extrude"
 tagline = "Click-to-extrude edges along world X/Y axes"
-maintainer = "Axis Extrude"
+maintainer = "Patryk M."
 type = "add-on"
 
 blender_version_min = "4.2.0"
