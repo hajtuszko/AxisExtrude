@@ -173,50 +173,21 @@ def find_nearest_vertex(obj, world_point, exclude_edge_index=None, max_dist=None
 def determine_vertex_drag_axis(obj, vert_index, world_point):
     """
     Decide which axis the vertex should move along when being dragged.
-    Picks the incident edge of the vertex closest to world_point in XY,
-    then moves perpendicular to that edge's direction.
-
-    Returns 'X' or 'Y' (the drag axis), or None if no incident edge found.
+    Axis is determined by the dominant delta between cursor and vertex:
+      cursor further along X → drag along X
+      cursor further along Y → drag along Y
+    Returns 'X' or 'Y', or None if vertex not found.
     """
     me = obj.data
     mw = obj.matrix_world
     if vert_index >= len(me.vertices):
         return None
-
-    # Find edges incident to this vertex
-    p = Vector((world_point.x, world_point.y))
     v_co = mw @ me.vertices[vert_index].co
-
-    best = None  # (dist, edge_axis)
-    for e in me.edges:
-        if vert_index not in e.vertices:
-            continue
-        # Other endpoint
-        other_idx = e.vertices[0] if e.vertices[1] == vert_index else e.vertices[1]
-        v1 = mw @ me.vertices[other_idx].co
-
-        a = Vector((v_co.x, v_co.y))
-        b = Vector((v1.x, v1.y))
-        seg = b - a
-        L2 = seg.length_squared
-        if L2 < 1e-12:
-            continue
-        t = max(0.0, min(1.0, (p - a).dot(seg) / L2))
-        closest = a + seg * t
-        d = (p - closest).length
-
-        if abs(seg.x) >= abs(seg.y):
-            edge_axis = 'X'  # edge runs along X → perpendicular drag = Y
-        else:
-            edge_axis = 'Y'
-        if best is None or d < best[0]:
-            best = (d, edge_axis)
-
-    if best is None:
-        return None
-    edge_axis = best[1]
-    # Drag perpendicular to the edge direction
-    return 'Y' if edge_axis == 'X' else 'X'
+    dx = abs(world_point.x - v_co.x)
+    dy = abs(world_point.y - v_co.y)
+    if dx == 0 and dy == 0:
+        return 'X'  # arbitrary fallback, user hasn't moved yet
+    return 'X' if dx >= dy else 'Y'
 
 
 def move_vertex_along_axis(obj, vert_index, axis, new_coord):
@@ -233,6 +204,22 @@ def move_vertex_along_axis(obj, vert_index, axis, new_coord):
         w.x = new_coord
     else:
         w.y = new_coord
+    v.co = mw_inv @ w
+    me.update()
+    return True
+
+
+def move_vertex_xy(obj, vert_index, new_x, new_y):
+    """Set the vertex's world X and Y coordinates simultaneously."""
+    me = obj.data
+    mw = obj.matrix_world
+    mw_inv = mw.inverted()
+    if vert_index >= len(me.vertices):
+        return False
+    v = me.vertices[vert_index]
+    w = mw @ v.co
+    w.x = new_x
+    w.y = new_y
     v.co = mw_inv @ w
     me.update()
     return True
@@ -645,11 +632,15 @@ def _draw_callback(op, context):
 
     # Dragging indicator — draw axis guide line through the vertex
     if dragging is not None:
-        vi, axis, _orig = dragging
+        vi, orig_x, orig_y = dragging
         obj = context.active_object
         if obj is not None and obj.type == 'MESH' and vi < len(obj.data.vertices):
             mw = obj.matrix_world
             vw = mw @ obj.data.vertices[vi].co
+            # Current axis = whichever coord differs from original
+            dx = abs(vw.x - orig_x)
+            dy = abs(vw.y - orig_y)
+            axis = 'X' if dx >= dy else 'Y'
             LEN = 1000.0
             if axis == 'X':
                 a = Vector((vw.x - LEN, vw.y, 0))
@@ -972,9 +963,8 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
         if event.type == 'RIGHTMOUSE' and event.value == 'PRESS':
             # If dragging a vertex, cancel the drag (restore original) instead of the addon
             if self._dragging_vertex is not None:
-                vi, axis, orig_coord = self._dragging_vertex
-                if orig_coord is not None:
-                    move_vertex_along_axis(context.active_object, vi, axis, orig_coord)
+                vi, orig_x, orig_y = self._dragging_vertex
+                move_vertex_xy(context.active_object, vi, orig_x, orig_y)
                 self._dragging_vertex = None
                 self._hover_vertex = None
                 self._preview_points = []
@@ -987,9 +977,8 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
 
         if event.type == 'ESC' and event.value == 'PRESS':
             if self._dragging_vertex is not None:
-                vi, axis, orig_coord = self._dragging_vertex
-                if orig_coord is not None:
-                    move_vertex_along_axis(context.active_object, vi, axis, orig_coord)
+                vi, orig_x, orig_y = self._dragging_vertex
+                move_vertex_xy(context.active_object, vi, orig_x, orig_y)
                 self._dragging_vertex = None
                 self._hover_vertex = None
                 self._preview_points = []
@@ -1051,26 +1040,36 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
             if target is not None and obj is not None:
                 self._last_mouse_world = target
 
-                # Vertex drag mode — move the captured vertex live
+                # Vertex drag mode — move the captured vertex live.
+                # Axis is re-evaluated each frame based on cursor position
+                # relative to the vertex's ORIGINAL location, so the user can
+                # switch axes simply by moving the mouse in a different
+                # dominant direction.
                 if self._dragging_vertex is not None:
-                    vidx, axis, _orig_other = self._dragging_vertex
-                    new_coord = target.x if axis == 'X' else target.y
-                    move_vertex_along_axis(obj, vidx, axis, new_coord)
-                    # Clear preview (dragging doesn't need extrude preview)
+                    vidx, orig_x, orig_y = self._dragging_vertex
+                    dx = abs(target.x - orig_x)
+                    dy = abs(target.y - orig_y)
+                    axis = 'X' if dx >= dy else 'Y'
+                    if axis == 'X':
+                        # Active axis follows cursor; inactive snaps back to orig
+                        move_vertex_xy(obj, vidx, target.x, orig_y)
+                    else:
+                        move_vertex_xy(obj, vidx, orig_x, target.y)
                     self._preview_points = []
                     self._preview_snap_point = None
                     if context.area:
                         context.area.tag_redraw()
                     return {'RUNNING_MODAL'}
 
-                # Hover detection — is the cursor close to an existing vertex?
-                HOVER_PIXELS = 15.0
+                # Hover detection — only when Shift is held (pickup mode)
                 self._hover_vertex = None
-                vert_hit = find_nearest_vertex(obj, target)
-                if vert_hit is not None:
-                    vw, vi = vert_hit
-                    if pixel_distance(context, vw, target) <= HOVER_PIXELS:
-                        self._hover_vertex = (vw, vi)
+                if event.shift:
+                    HOVER_PIXELS = 15.0
+                    vert_hit = find_nearest_vertex(obj, target)
+                    if vert_hit is not None:
+                        vw, vi = vert_hit
+                        if pixel_distance(context, vw, target) <= HOVER_PIXELS:
+                            self._hover_vertex = (vw, vi)
 
                 # When locked, keep the candidate frozen — only refresh preview
                 if not self._edge_locked:
@@ -1097,19 +1096,17 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
                     context.area.tag_redraw()
                 return {'RUNNING_MODAL'}
 
-            # Vertex drag pickup — if cursor is hovering a vertex, start drag
-            if self._hover_vertex is not None and not self._edge_locked:
+            # Vertex drag pickup — Shift+LPM on a hovered vertex
+            if event.shift and self._hover_vertex is not None and not self._edge_locked:
                 vw, vi = self._hover_vertex
-                axis = determine_vertex_drag_axis(obj, vi, target)
-                if axis is not None:
-                    # Remember original coord on drag axis for cancel
-                    orig_coord = vw.x if axis == 'X' else vw.y
-                    self._dragging_vertex = (vi, axis, orig_coord)
-                    self._preview_points = []
-                    self._preview_snap_point = None
-                    if context.area:
-                        context.area.tag_redraw()
-                    return {'RUNNING_MODAL'}
+                # Store original XY so we can restore either axis when the
+                # cursor dominance changes during drag, or on cancel.
+                self._dragging_vertex = (vi, vw.x, vw.y)
+                self._preview_points = []
+                self._preview_snap_point = None
+                if context.area:
+                    context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
 
             # Locked loopcut — use frozen face + axis, apply vertex snap
             if self._edge_locked and self._locked_mode == 'loopcut':
@@ -1329,6 +1326,7 @@ class AXISEXTRUDE_PT_panel(bpy.types.Panel):
         box.label(text="• Click — extrude to cursor")
         box.label(text="• Press X — lock/unlock selection")
         box.label(text="• Click inside a face — loop cut")
+        box.label(text="• Shift+Click a vertex — drag on axis")
         box.label(text="• Snaps to nearby vertex")
         box.label(text="• On disable: merge 0.01 cm")
         box.label(text="• Right-click — disable")
