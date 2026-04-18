@@ -220,6 +220,152 @@ def extrude_edge_to_point(obj, edge_index, extrude_axis, target_world):
     return True
 
 
+def find_face_at_point(obj, world_point):
+    """
+    Return (face_index, face_axis) for a face containing world_point in XY,
+    or None if no face contains the point.
+      - face_axis: 'X' or 'Y' — the axis along which the face is longer
+                   (so loop-cut will be perpendicular to this axis)
+    """
+    if obj is None or obj.type != 'MESH':
+        return None
+
+    me = obj.data
+    mw = obj.matrix_world
+    p = Vector((world_point.x, world_point.y))
+
+    best = None  # (area, face_index, face_axis)
+    for f in me.polygons:
+        if len(f.vertices) < 3:
+            continue
+
+        # Gather face vertices in XY
+        pts = [mw @ me.vertices[vi].co for vi in f.vertices]
+        pts_xy = [Vector((v.x, v.y)) for v in pts]
+
+        # Point-in-polygon (ray casting)
+        inside = False
+        n = len(pts_xy)
+        j = n - 1
+        for i in range(n):
+            xi, yi = pts_xy[i].x, pts_xy[i].y
+            xj, yj = pts_xy[j].x, pts_xy[j].y
+            if ((yi > p.y) != (yj > p.y)):
+                x_int = (xj - xi) * (p.y - yi) / (yj - yi + 1e-30) + xi
+                if p.x < x_int:
+                    inside = not inside
+            j = i
+        if not inside:
+            continue
+
+        # Determine face axis from bbox: longer side = face_axis
+        xs = [v.x for v in pts_xy]
+        ys = [v.y for v in pts_xy]
+        size_x = max(xs) - min(xs)
+        size_y = max(ys) - min(ys)
+        face_axis = 'X' if size_x >= size_y else 'Y'
+
+        # Prefer smallest face if overlapping (approximate via bbox area)
+        area = size_x * size_y
+        if best is None or area < best[0]:
+            best = (area, f.index, face_axis)
+
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def loop_cut_face_at_point(obj, face_index, world_point):
+    """
+    Split the given face with a perpendicular cut at world_point.
+    The cut is placed across the face's longer axis at the cursor's coordinate
+    along that axis (snap to world X or Y, whichever matches the face's long side).
+
+    Implementation: find the two edges of the face that run along the face's
+    SHORT axis (i.e., perpendicular to the long axis), compute the cut positions
+    on each, and use bmesh to subdivide/connect.
+    """
+    me = obj.data
+    mw = obj.matrix_world
+    mw_inv = mw.inverted()
+
+    if face_index >= len(me.polygons):
+        return False
+
+    # Pre-compute face axis (longer side)
+    face = me.polygons[face_index]
+    pts = [mw @ me.vertices[vi].co for vi in face.vertices]
+    xs = [v.x for v in pts]
+    ys = [v.y for v in pts]
+    size_x = max(xs) - min(xs)
+    size_y = max(ys) - min(ys)
+    long_axis = 'X' if size_x >= size_y else 'Y'
+
+    # Cursor coordinate on the long axis = where the cut should be
+    cut_coord = world_point.x if long_axis == 'X' else world_point.y
+
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.faces.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.verts.ensure_lookup_table()
+
+    if face_index >= len(bm.faces):
+        bm.free()
+        return False
+    bface = bm.faces[face_index]
+    if not bface.is_valid:
+        bm.free()
+        return False
+
+    # Find edges that CROSS the cut line — i.e., edges whose endpoints straddle
+    # cut_coord on the long axis. These are the edges we subdivide.
+    edges_to_cut = []
+    for e in bface.edges:
+        v0 = mw @ e.verts[0].co
+        v1 = mw @ e.verts[1].co
+        a = v0.x if long_axis == 'X' else v0.y
+        b = v1.x if long_axis == 'X' else v1.y
+        # Strictly straddle (avoid cutting AT existing vertex)
+        if (a - cut_coord) * (b - cut_coord) < -1e-9:
+            # Parametric position of cut on this edge
+            t = (cut_coord - a) / (b - a)
+            edges_to_cut.append((e, t, v0, v1))
+
+    if len(edges_to_cut) < 2:
+        bm.free()
+        return False
+
+    # Subdivide each edge at the computed t — creates new vertex at cut_coord
+    new_verts = []
+    for e, t, v0, v1 in edges_to_cut:
+        # bmesh.utils.edge_split returns (new_edge, new_vert)
+        new_edge, new_vert = bmesh.utils.edge_split(e, e.verts[0], t)
+        # Force exact world-coord on the long axis so snap to world is exact
+        nw = mw @ new_vert.co
+        if long_axis == 'X':
+            nw.x = cut_coord
+        else:
+            nw.y = cut_coord
+        new_vert.co = mw_inv @ nw
+        new_verts.append(new_vert)
+
+    # Connect the new vertices through the face to create the cut edge
+    if len(new_verts) >= 2:
+        try:
+            bmesh.ops.connect_verts(bm, verts=new_verts)
+        except Exception:
+            bm.free()
+            return False
+
+    bm.to_mesh(me)
+    bm.free()
+    me.update()
+    return True
+
+
+
+
 # ---------------------------------------------------------------------------
 # Drawing (preview line)
 # ---------------------------------------------------------------------------
@@ -308,6 +454,8 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
         self._cycle_offset = 0           # which candidate from sorted list
         self._last_mouse_world = None    # last XY target under cursor
         self._last_candidates = []       # cached candidate list
+        self._edge_locked = False        # X toggles this — freezes edge selection
+        self._locked_candidate = None    # candidate dict that is locked
 
         args = (self, context)
         _draw_handle["handle"] = bpy.types.SpaceView3D.draw_handler_add(
@@ -334,7 +482,11 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
     # ---- helpers used by modal ---------------------------------------------
 
     def _pick_candidate(self):
-        """Return the currently selected candidate from the cached list, or None."""
+        """Return the currently selected candidate.
+        If locked, return the frozen one regardless of cursor position.
+        Otherwise return the offset-th candidate from the sorted list."""
+        if self._edge_locked and self._locked_candidate is not None:
+            return self._locked_candidate
         if not self._last_candidates:
             return None
         idx = self._cycle_offset % len(self._last_candidates)
@@ -372,6 +524,17 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
 
     def _build_preview(self, context, obj, target_world):
         """Recompute preview lines and snap indicator based on current state."""
+        # Loop-cut preview takes priority when cursor is inside a face and not locked
+        if not self._edge_locked:
+            face_hit = find_face_at_point(obj, target_world)
+            if face_hit is not None:
+                face_idx, _fa = face_hit
+                pts = self._compute_loop_cut_preview(obj, face_idx, target_world)
+                if pts:
+                    self._preview_points = pts
+                    self._preview_snap_point = None
+                    return
+
         candidate = self._pick_candidate()
         if candidate is None:
             self._preview_points = []
@@ -404,6 +567,48 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
         ]
         self._preview_snap_point = snap_vert
 
+    def _compute_loop_cut_preview(self, obj, face_index, world_point):
+        """Return a 2-point line list approximating the loop cut for preview."""
+        me = obj.data
+        mw = obj.matrix_world
+        if face_index >= len(me.polygons):
+            return None
+        face = me.polygons[face_index]
+        pts = [mw @ me.vertices[vi].co for vi in face.vertices]
+        xs = [v.x for v in pts]
+        ys = [v.y for v in pts]
+        size_x = max(xs) - min(xs)
+        size_y = max(ys) - min(ys)
+        long_axis = 'X' if size_x >= size_y else 'Y'
+        cut_coord = world_point.x if long_axis == 'X' else world_point.y
+
+        # Find crossings: walk edge-by-edge, find intersections with the cut line
+        hits = []
+        n = len(pts)
+        for i in range(n):
+            a = pts[i]
+            b = pts[(i + 1) % n]
+            a_c = a.x if long_axis == 'X' else a.y
+            b_c = b.x if long_axis == 'X' else b.y
+            if (a_c - cut_coord) * (b_c - cut_coord) < -1e-9:
+                t = (cut_coord - a_c) / (b_c - a_c)
+                hit = a.lerp(b, t)
+                # Snap on long axis for exactness
+                if long_axis == 'X':
+                    hit.x = cut_coord
+                else:
+                    hit.y = cut_coord
+                hits.append(hit)
+
+        if len(hits) < 2:
+            return None
+        # Use the two extremes along the short axis
+        if long_axis == 'X':
+            hits.sort(key=lambda p: p.y)
+        else:
+            hits.sort(key=lambda p: p.x)
+        return [hits[0], hits[-1]]
+
     # ---- modal loop --------------------------------------------------------
 
     def modal(self, context, event):
@@ -422,25 +627,34 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
             self._cancel(context)
             return {'CANCELLED'}
 
-        # Cycle edge candidate with X
+        # Toggle lock on current edge selection with X
         if event.type == 'X' and event.value == 'PRESS':
-            if self._last_candidates:
-                self._cycle_offset = (self._cycle_offset + 1) % len(self._last_candidates)
-                if self._last_mouse_world is not None:
-                    self._build_preview(context, context.active_object,
-                                        self._last_mouse_world)
-                    if context.area:
-                        context.area.tag_redraw()
+            if self._edge_locked:
+                # Unlock
+                self._edge_locked = False
+                self._locked_candidate = None
+            else:
+                # Lock whatever is currently picked
+                current = self._pick_candidate()
+                if current is not None:
+                    self._edge_locked = True
+                    self._locked_candidate = dict(current)  # snapshot
+            if self._last_mouse_world is not None:
+                self._build_preview(context, context.active_object,
+                                    self._last_mouse_world)
+                if context.area:
+                    context.area.tag_redraw()
             return {'RUNNING_MODAL'}
 
         if event.type == 'MOUSEMOVE':
             target = mouse_to_world_xy(context, event)
             obj = context.active_object
             if target is not None and obj is not None:
-                # Rebuild candidate list on movement; reset cycle offset
-                self._last_candidates = find_edge_candidates(obj, target)
-                self._cycle_offset = 0
                 self._last_mouse_world = target
+                # When locked, keep the candidate frozen — only refresh preview
+                if not self._edge_locked:
+                    self._last_candidates = find_edge_candidates(obj, target)
+                    self._cycle_offset = 0
                 self._build_preview(context, obj, target)
                 if context.area:
                     context.area.tag_redraw()
@@ -451,13 +665,29 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
             if target is None or obj is None:
                 return {'RUNNING_MODAL'}
 
-            # Make sure candidate list is fresh
-            if not self._last_candidates or self._last_mouse_world != target:
-                self._last_candidates = find_edge_candidates(obj, target)
-                # Keep cycle_offset — user may have pressed X before click
-                if self._cycle_offset >= len(self._last_candidates):
+            # If cursor is inside a face and edge is NOT locked → loop cut
+            if not self._edge_locked:
+                face_hit = find_face_at_point(obj, target)
+                if face_hit is not None:
+                    face_idx, _face_axis = face_hit
+                    ok = loop_cut_face_at_point(obj, face_idx, target)
+                    if not ok:
+                        self.report({'WARNING'}, "Loop cut failed")
+                    self._preview_points = []
+                    self._preview_snap_point = None
+                    self._last_candidates = []
                     self._cycle_offset = 0
-                self._last_mouse_world = target
+                    if context.area:
+                        context.area.tag_redraw()
+                    return {'RUNNING_MODAL'}
+
+            # Ensure candidate list is fresh when not locked
+            if not self._edge_locked:
+                if not self._last_candidates or self._last_mouse_world != target:
+                    self._last_candidates = find_edge_candidates(obj, target)
+                    if self._cycle_offset >= len(self._last_candidates):
+                        self._cycle_offset = 0
+                    self._last_mouse_world = target
 
             candidate = self._pick_candidate()
             if candidate is None:
@@ -474,10 +704,13 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
             if not ok:
                 self.report({'WARNING'}, "Extrude failed")
 
+            # Reset state — auto-unlock after click
             self._preview_points = []
             self._preview_snap_point = None
             self._last_candidates = []
             self._cycle_offset = 0
+            self._edge_locked = False
+            self._locked_candidate = None
             if context.area:
                 context.area.tag_redraw()
             return {'RUNNING_MODAL'}
@@ -541,7 +774,8 @@ class AXISEXTRUDE_PT_panel(bpy.types.Panel):
         box.label(text="• Top view (XY) 2D workflow")
         box.label(text="• Move mouse — nearest edge highlights")
         box.label(text="• Click — extrude to cursor")
-        box.label(text="• Press X — cycle edge candidate")
+        box.label(text="• Press X — lock/unlock edge selection")
+        box.label(text="• Click inside a face — loop cut")
         box.label(text="• Snaps to nearby vertex on extrude axis")
         box.label(text="• Right-click — disable")
 
