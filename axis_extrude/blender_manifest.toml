@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "axis_extrude"
+version = "1.0.0"
+name = "Axis Extrude"
+tagline = "Click-to-extrude edges along world X/Y axes"
+maintainer = "Axis Extrude"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-2.0-or-later",
+]
+
+tags = ["Mesh", "Modeling"]
