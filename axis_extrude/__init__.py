@@ -671,7 +671,9 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
                 if face_hit is not None:
                     face_idx, _face_axis = face_hit
                     ok = loop_cut_face_at_point(obj, face_idx, target)
-                    if not ok:
+                    if ok:
+                        bpy.ops.ed.undo_push(message="Axis Extrude: Loop Cut")
+                    else:
                         self.report({'WARNING'}, "Loop cut failed")
                     self._preview_points = []
                     self._preview_snap_point = None
@@ -701,7 +703,9 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
             ok = extrude_edge_to_point(
                 obj, candidate["index"], candidate["extrude_axis"], final_target
             )
-            if not ok:
+            if ok:
+                bpy.ops.ed.undo_push(message="Axis Extrude: Extrude")
+            else:
                 self.report({'WARNING'}, "Extrude failed")
 
             # Reset state — auto-unlock after click
