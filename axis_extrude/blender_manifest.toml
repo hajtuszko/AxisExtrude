@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "axis_extrude"
-version = "0.2.0"
+version = "0.3.0"
 name = "Axis Extrude"
-tagline = "Click-to-extrude edges along world X/Y axes"
+tagline = "Click-to-extrude along world axes in top, front and side views"
 maintainer = "Patryk M."
 type = "add-on"
 
