@@ -48,8 +48,8 @@ VIEW_FOR_SIDE = {
 VIEW_AXIS = {'TOP': 2, 'BOTTOM': 2, 'FRONT': 1, 'BACK': 1, 'RIGHT': 0, 'LEFT': 0}
 OPPOSITE_VIEW = {'TOP': 'BOTTOM', 'BOTTOM': 'TOP', 'FRONT': 'BACK', 'BACK': 'FRONT',
                  'RIGHT': 'LEFT', 'LEFT': 'RIGHT'}
-VIEW_LABEL = {'TOP': "Góra", 'BOTTOM': "Dół", 'FRONT': "Przód", 'BACK': "Tył",
-              'RIGHT': "Prawy", 'LEFT': "Lewy"}
+VIEW_LABEL = {'TOP': "Top", 'BOTTOM': "Bottom", 'FRONT': "Front", 'BACK': "Back",
+              'RIGHT': "Right", 'LEFT': "Left"}
 
 
 class WorkPlane:
@@ -777,11 +777,11 @@ def hud_layout(context, region, plane, mode, pin):
             items.append(("view:" + slot, VIEW_LABEL[opposite], True, 1))
         else:
             items.append(("view:" + slot, VIEW_LABEL[slot], current == slot, 1))
-    items.append(("mode:NEAREST", "Najbliższe", mode == 'NEAREST', 2))
-    items.append(("mode:ALL", "Wszystkie", mode == 'ALL', 2))
+    items.append(("mode:NEAREST", "Nearest", mode == 'NEAREST', 2))
+    items.append(("mode:ALL", "All", mode == 'ALL', 2))
     if pin is not None:
         cm = blender_units_to_cm(context, pin[1])
-        items.append(("unpin", f"Ściana {AXES[pin[0]]} = {cm:.0f} cm  [x]", True, 3))
+        items.append(("unpin", f"Wall {AXES[pin[0]]} = {cm:.0f} cm  [x]", True, 3))
 
     blf.size(HUD_FONT, 13 * scale)
     pad_x = 10 * scale
@@ -999,7 +999,7 @@ def _draw_pixel_callback(op, context):
             label = "→ " + VIEW_LABEL[gesture_view(delta, detect_plane(rv3d).view_type)]
             color = (1.0, 1.0, 1.0, 1.0)
         else:
-            label = "puść: wyłącz addon"
+            label = "release: disable add-on"
             color = (1.0, 0.6, 0.6, 1.0)
         _draw_text(cur.x + 14, cur.y + 8, label, color, 14)
 
@@ -1261,7 +1261,7 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
             with context.temp_override(area=context.area, region=view.region):
                 bpy.ops.view3d.view_axis(type=view_type)
         except Exception as exc:
-            self.report({'WARNING'}, f"Nie udało się zmienić widoku: {exc}")
+            self.report({'WARNING'}, f"Could not change the view: {exc}")
             return
         if self._pin is not None and self._pin[0] != VIEW_AXIS[view_type]:
             self._pin = None
@@ -1292,7 +1292,7 @@ class AXISEXTRUDE_OT_modal(bpy.types.Operator):
         plane = detect_plane(view.rv3d)
         found = view_for_face_normal(normal, plane.view_dir)
         if found is None:
-            self.report({'WARNING'}, "Ta ściana nie jest równoległa do osi X / Y / Z")
+            self.report({'WARNING'}, "This wall is not parallel to the X / Y / Z axis")
             return
         view_type, n = found
         face = polys[face_index]
@@ -2100,18 +2100,18 @@ class AXISEXTRUDE_state(bpy.types.PropertyGroup):
         default=False,
     )
     enforce_min_distance: bpy.props.BoolProperty(
-        name="Minimalna ekstruzja 10 cm",
-        description="Wymusza minimalną ekstruzję 10 cm. Snap do vertexa zawsze ignoruje to ograniczenie.",
+        name="Minimum 10 cm extrude",
+        description="Enforces a minimum extrude of 10 cm. Snapping to a vertex always ignores this limit.",
         default=True,
     )
     depth_mode: bpy.props.EnumProperty(
-        name="Elementy",
-        description="Na których elementach działać, gdy w widoku pokrywają się ze sobą",
+        name="Elements",
+        description="Which elements to act on when they overlap in the view",
         items=(
-            ('NEAREST', "Najbliższe",
-             "Tylko element najbliższy widokowi (albo wskazana dwuklikiem MMB ściana)"),
-            ('ALL', "Wszystkie",
-             "Wszystkie elementy, które w widoku pokrywają się ze sobą"),
+            ('NEAREST', "Nearest",
+             "Only the element nearest to the viewer (or the wall picked with an MMB double-click)"),
+            ('ALL', "All",
+             "All elements that overlap in the view"),
         ),
         default='NEAREST',
     )
